@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <cstdio>
 #include <iostream>
 #include <assert.h>
 #include <math.h>
@@ -30,6 +31,29 @@
 
 #define ENABLE_AGC_DEFAULT
 using namespace std;
+
+static std::string get_rf_arg_value(const std::string& rf_args, const std::string& key)
+{
+  const std::string prefix = key + "=";
+  size_t            start  = 0;
+
+  while (start <= rf_args.size()) {
+    size_t end = rf_args.find(',', start);
+    if (end == std::string::npos) {
+      end = rf_args.size();
+    }
+    std::string token = rf_args.substr(start, end - start);
+    if (token.rfind(prefix, 0) == 0) {
+      return token.substr(prefix.size());
+    }
+    if (end == rf_args.size()) {
+      break;
+    }
+    start = end + 1;
+  }
+
+  return "";
+}
 
 static bool stage_raw_input_file(const Args& args, const srsran_cell_t& cell, std::string& staged_path)
 {
@@ -395,6 +419,9 @@ bool LTESniffer_Core::run(){
   rf_live_source_t     rf_live_source = {};
   bool                 use_raw_sync_mode = args.input_file_raw_sync;
   std::string          file_input_name   = args.input_file_name;
+  std::string          staged_input_path;
+  int64_t              file_offset_time  = args.file_offset_time;
+  double               file_offset_freq  = args.file_offset_freq;
   srsran_cell_t      cell;
   falcon_ue_dl_t     falcon_ue_dl;
   srsran_dl_sf_cfg_t dl_sf;
@@ -442,6 +469,10 @@ bool LTESniffer_Core::run(){
       fprintf(stderr, "Error opening rf\n");
       exit(-1);
     }
+    std::string rx_ant = get_rf_arg_value(args.rf_args, "rxant");
+    if (!rx_ant.empty()) {
+      printf("Selected RX antenna: %s\n", rx_ant.c_str());
+    }
     /* Set receiver gain */
     if (args.rf_gain > 0) {
       srsran_rf_set_rx_gain(&rf, args.rf_gain);
@@ -470,7 +501,8 @@ bool LTESniffer_Core::run(){
       ERROR("Uplink Frequency must be defined in the UL Sniffer Mode \n");
     } else if (sniffer_mode == DL_MODE && args.ul_freq == 0){
       printf("Tunning receiver to %.3f MHz\n", (args.rf_freq + args.file_offset_freq) / 1000000);
-      srsran_rf_set_rx_freq(&rf, args.rf_nof_rx_ant, args.rf_freq + args.file_offset_freq);
+      double actual_rx_freq = srsran_rf_set_rx_freq(&rf, 0, args.rf_freq + args.file_offset_freq);
+      printf("Actual receiver freq: %.3f MHz\n", actual_rx_freq / 1000000.0);
     } else if (sniffer_mode == DL_MODE && args.ul_freq != 0){
         ERROR("Uplink Frequency must be 0 in the DL Sniffer Mode \n");
     }
@@ -573,6 +605,16 @@ bool LTESniffer_Core::run(){
     cell.nof_prb         = args.nof_prb;
 
     if (use_raw_sync_mode) {
+      if (!stage_raw_input_file(args, cell, staged_input_path)) {
+        exit(-1);
+      }
+      file_input_name    = staged_input_path;
+      file_offset_time   = 0;
+      file_offset_freq   = 0.0;
+      use_raw_sync_mode  = false;
+    }
+
+    if (use_raw_sync_mode) {
       if (args.rf_nof_rx_ant != 1) {
         ERROR("Raw input file sync mode currently supports exactly one RX antenna");
         exit(-1);
@@ -598,10 +640,10 @@ bool LTESniffer_Core::run(){
         cout << "Treating raw input file as interleaved cf32 IQ" << endl;
       }
 
-      if (args.file_offset_time != 0) {
+      if (file_offset_time != 0) {
         off_t bytes_per_sample = raw_input_file.input_is_sc16 ? static_cast<off_t>(sizeof(int16_t) * 2)
                                                               : static_cast<off_t>(sizeof(cf_t));
-        off_t byte_offset = static_cast<off_t>(args.file_offset_time) * bytes_per_sample;
+        off_t byte_offset = static_cast<off_t>(file_offset_time) * bytes_per_sample;
         if (fseeko(raw_input_file.file, byte_offset, SEEK_SET) != 0) {
           perror("fseeko");
           fclose(raw_input_file.file);
@@ -610,7 +652,7 @@ bool LTESniffer_Core::run(){
         }
       }
 
-      if (args.file_offset_freq != 0.0) {
+      if (file_offset_freq != 0.0) {
         uint32_t raw_cfo_block_len = 3 * SRSRAN_SF_LEN_PRB(cell.nof_prb);
         if (srsran_cfo_init(&raw_input_file.cfo_correct, raw_cfo_block_len)) {
           ERROR("Error initiating raw input CFO corrector");
@@ -619,8 +661,8 @@ bool LTESniffer_Core::run(){
           exit(-1);
         }
         raw_input_file.apply_cfo = true;
-        raw_input_file.cfo_freq  = static_cast<float>(args.file_offset_freq / 15000.0 / srsran_symbol_sz(cell.nof_prb));
-        cout << "Applying raw input frequency correction of " << args.file_offset_freq << " Hz" << endl;
+        raw_input_file.cfo_freq  = static_cast<float>(file_offset_freq / 15000.0 / srsran_symbol_sz(cell.nof_prb));
+        cout << "Applying raw input frequency correction of " << file_offset_freq << " Hz" << endl;
       }
 
       if (srsran_ue_sync_init_multi(&ue_sync,
@@ -647,8 +689,8 @@ bool LTESniffer_Core::run(){
       if (srsran_ue_sync_init_file_multi(&ue_sync,
                                          args.nof_prb,
                                          tmp_filename,
-                                         args.file_offset_time,
-                                         args.file_offset_freq,
+                                         file_offset_time,
+                                         file_offset_freq,
                                          args.rf_nof_rx_ant)) { //args.rf_nof_rx_ant
         ERROR("Error initiating ue_sync");
         exit(-1);
@@ -1068,6 +1110,9 @@ bool LTESniffer_Core::run(){
     if (raw_input_file.apply_cfo) {
       srsran_cfo_free(&raw_input_file.cfo_correct);
     }
+  }
+  if (!staged_input_path.empty()) {
+    unlink(staged_input_path.c_str());
   }
   //srsran_ue_dl_free(falcon_ue_dl.q);
   srsran_ue_sync_free(&ue_sync);
