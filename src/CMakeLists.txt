@@ -8,6 +8,15 @@ target_link_libraries(LTESniffer DL_Sniffer_lib falcon_common falcon_phy falcon_
 target_compile_options(LTESniffer PUBLIC "-std=c++11")
 list(APPEND INSTALL_BUNDLE LTESniffer)
 
+add_executable(AlignIQToSf0 AlignIQToSf0.c)
+target_link_libraries(AlignIQToSf0 srsran_phy)
+list(APPEND INSTALL_BUNDLE AlignIQToSf0)
+
+add_executable(UhdCaptureRobust UhdCaptureRobust.cc)
+target_link_libraries(UhdCaptureRobust ${UHD_LIBRARIES} ${Boost_LIBRARIES})
+target_compile_options(UhdCaptureRobust PUBLIC "-std=c++11")
+list(APPEND INSTALL_BUNDLE UhdCaptureRobust)
+
 # nested install targets are not supported by old Cmake on Ubuntu 18
 #list (APPEND INSTALL_BUNDLE
 #    falcon_capture_probe

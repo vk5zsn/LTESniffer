@@ -31,6 +31,285 @@
 #define ENABLE_AGC_DEFAULT
 using namespace std;
 
+static bool stage_raw_input_file(const Args& args, const srsran_cell_t& cell, std::string& staged_path)
+{
+  raw_iq_file_source_t source = {};
+  srsran_ue_sync_t     stage_sync;
+  srsran_ue_mib_t      stage_mib;
+  cf_t*                stage_buffer0 = nullptr;
+  cf_t*                stage_buffers[SRSRAN_MAX_CHANNELS] = {};
+  FILE*                output = nullptr;
+  bool                 success = false;
+  bool                 stage_mib_init = false;
+  bool                 mib_found = false;
+  char                 temp_path[] = "/tmp/ltesniffer_raw_sync_XXXXXX";
+  uint32_t             sf_len = SRSRAN_SF_LEN_PRB(cell.nof_prb);
+  uint32_t             max_num_samples = 3 * sf_len;
+  uint64_t             searched_subframes = 0;
+  uint64_t             written_subframes = 0;
+  uint64_t             max_stage_subframes = args.nof_subframes == 0 ? 0 : args.nof_subframes + 1000;
+  uint64_t             min_stage_subframes = args.nof_subframes == 0 ? 1000 : std::min<uint64_t>(args.nof_subframes, 1000);
+  bool                 started = false;
+  uint32_t             expected_sf_idx = 0;
+
+  if (args.rf_nof_rx_ant != 1) {
+    ERROR("Raw input file sync mode currently supports exactly one RX antenna");
+    return false;
+  }
+
+  if (sf_len == 0) {
+    ERROR("Invalid number of PRB %d for raw staging", cell.nof_prb);
+    return false;
+  }
+
+  bzero(&stage_sync, sizeof(stage_sync));
+
+  source.file = fopen(args.input_file_name.c_str(), "rb");
+  if (source.file == nullptr) {
+    perror(args.input_file_name.c_str());
+    return false;
+  }
+
+  int temp_fd = mkstemp(temp_path);
+  if (temp_fd < 0) {
+    perror("mkstemp");
+    goto cleanup;
+  }
+
+  output = fdopen(temp_fd, "wb");
+  if (output == nullptr) {
+    perror("fdopen");
+    close(temp_fd);
+    unlink(temp_path);
+    goto cleanup;
+  }
+
+  stage_buffer0 = srsran_vec_cf_malloc(max_num_samples);
+  if (stage_buffer0 == nullptr) {
+    ERROR("Error allocating raw staging buffer");
+    goto cleanup;
+  }
+  stage_buffers[0] = stage_buffer0;
+
+  if (srsran_ue_sync_init_multi(&stage_sync, cell.nof_prb, false, raw_iq_file_recv_wrapper, 1, &source)) {
+    ERROR("Error initiating ue_sync for raw input staging");
+    goto cleanup;
+  }
+  if (srsran_ue_sync_set_cell(&stage_sync, cell)) {
+    ERROR("Error setting LTE cell for raw input staging");
+    goto cleanup_sync;
+  }
+  if (srsran_ue_mib_init(&stage_mib, stage_buffer0, cell.nof_prb)) {
+    ERROR("Error initiating UE MIB decoder for raw input staging");
+    goto cleanup_sync;
+  }
+  {
+    srsran_cell_t mib_cell = cell;
+    mib_cell.nof_ports = 0;
+    if (srsran_ue_mib_set_cell(&stage_mib, mib_cell)) {
+      ERROR("Error configuring UE MIB decoder for raw input staging");
+      goto cleanup_mib;
+    }
+  }
+  stage_mib_init = true;
+
+  stage_sync.cfo_current_value       = 0.0f;
+  stage_sync.cfo_is_copied           = true;
+  stage_sync.cfo_correct_enable_find = true;
+  srsran_sync_set_cfo_cp_enable(&stage_sync.sfind, false, 0);
+  srsran_sync_set_threshold(&stage_sync.sfind, 1.5f);
+
+  while (max_stage_subframes == 0 || written_subframes < max_stage_subframes) {
+    int      sync_ret = srsran_ue_sync_zerocopy(&stage_sync, stage_buffers, max_num_samples);
+    uint32_t sf_idx   = srsran_ue_sync_get_sfidx(&stage_sync);
+
+    if (sync_ret < 0) {
+      if (source.eof) {
+        break;
+      }
+      ERROR("Error receiving samples while staging raw input file");
+      goto cleanup_sync;
+    }
+
+    if (!started) {
+      searched_subframes++;
+      if (searched_subframes > 4000) {
+        ERROR("Failed to lock to a subframe-0 boundary while staging raw input file");
+        goto cleanup_sync;
+      }
+      if (sync_ret != 1 || sf_idx != 0) {
+        continue;
+      }
+      started = true;
+      mib_found = false;
+      srsran_ue_mib_reset(&stage_mib);
+      cout << "Raw input staging locked at raw_samples=" << source.samples_read << endl;
+    }
+
+    if (sync_ret != 1) {
+      if (written_subframes < min_stage_subframes && !source.eof) {
+        cout << "Raw input staging discarded short lock after " << written_subframes
+             << " synchronized subframes" << endl;
+        if (ftruncate(fileno(output), 0) != 0) {
+          perror("ftruncate");
+          goto cleanup_sync;
+        }
+        rewind(output);
+        written_subframes = 0;
+        searched_subframes = 0;
+        started           = false;
+        mib_found         = false;
+        srsran_ue_mib_reset(&stage_mib);
+        expected_sf_idx   = 0;
+        continue;
+      }
+      if (!mib_found && !source.eof) {
+        cout << "Raw input staging discarded lock without a valid MIB after " << written_subframes
+             << " synchronized subframes" << endl;
+        if (ftruncate(fileno(output), 0) != 0) {
+          perror("ftruncate");
+          goto cleanup_mib;
+        }
+        rewind(output);
+        written_subframes = 0;
+        searched_subframes = 0;
+        started           = false;
+        srsran_ue_mib_reset(&stage_mib);
+        expected_sf_idx   = 0;
+        continue;
+      }
+      cout << "Raw input staging stopped after " << written_subframes << " synchronized subframes" << endl;
+      break;
+    }
+    if (sf_idx != expected_sf_idx) {
+      if (written_subframes < min_stage_subframes) {
+        cout << "Raw input staging discarded short lock after sf_idx jump at " << written_subframes
+             << " synchronized subframes" << endl;
+        if (ftruncate(fileno(output), 0) != 0) {
+          perror("ftruncate");
+          goto cleanup_sync;
+        }
+        rewind(output);
+        written_subframes = 0;
+        searched_subframes = 0;
+        started           = false;
+        mib_found         = false;
+        srsran_ue_mib_reset(&stage_mib);
+        expected_sf_idx   = 0;
+        continue;
+      }
+      if (!mib_found) {
+        cout << "Raw input staging discarded lock without a valid MIB after sf_idx jump at "
+             << written_subframes << " synchronized subframes" << endl;
+        if (ftruncate(fileno(output), 0) != 0) {
+          perror("ftruncate");
+          goto cleanup_mib;
+        }
+        rewind(output);
+        written_subframes = 0;
+        searched_subframes = 0;
+        started           = false;
+        srsran_ue_mib_reset(&stage_mib);
+        expected_sf_idx   = 0;
+        continue;
+      }
+      cout << "Raw input staging lost contiguous sf_idx sequence after " << written_subframes
+           << " subframes (expected " << expected_sf_idx << ", got " << sf_idx << ")" << endl;
+      break;
+    }
+
+    if (!mib_found && sf_idx == 0) {
+      uint8_t        bch_payload[SRSRAN_BCH_PAYLOAD_LEN];
+      int            sfn_offset = 0;
+      srsran_cell_t  decoded_mib_cell = cell;
+      uint32_t       decoded_sfn = 0;
+      int            mib_ret = srsran_ue_mib_decode(&stage_mib, bch_payload, nullptr, &sfn_offset);
+      if (mib_ret == SRSRAN_UE_MIB_FOUND) {
+        srsran_pbch_mib_unpack(bch_payload, &decoded_mib_cell, &decoded_sfn);
+        if (srsran_cell_isvalid(&decoded_mib_cell) && decoded_mib_cell.nof_prb == cell.nof_prb) {
+          mib_found = true;
+          cout << "Raw input staging found valid MIB at SFN " << decoded_sfn << endl;
+        } else {
+          srsran_ue_mib_reset(&stage_mib);
+        }
+      } else if (mib_ret < 0) {
+        ERROR("Error decoding UE MIB during raw input staging");
+        goto cleanup_mib;
+      }
+    }
+
+    if (fwrite(stage_buffers[0], sizeof(cf_t), sf_len, output) != sf_len) {
+      perror("fwrite");
+      goto cleanup_mib;
+    }
+
+    written_subframes++;
+    expected_sf_idx = (expected_sf_idx + 1) % 10;
+
+    if ((written_subframes % 1000) == 0) {
+      cout << "Raw input staging wrote " << written_subframes << " synchronized subframes" << endl;
+    }
+
+    if (max_stage_subframes != 0 && written_subframes >= max_stage_subframes && !mib_found && !source.eof) {
+      cout << "Raw input staging discarded lock without a valid MIB after reaching "
+           << written_subframes << " synchronized subframes" << endl;
+      if (ftruncate(fileno(output), 0) != 0) {
+        perror("ftruncate");
+        goto cleanup_mib;
+      }
+      rewind(output);
+      written_subframes = 0;
+      searched_subframes = 0;
+      started           = false;
+      mib_found         = false;
+      srsran_ue_mib_reset(&stage_mib);
+      expected_sf_idx   = 0;
+      continue;
+    }
+  }
+
+  if (written_subframes == 0) {
+    ERROR("Raw input staging did not produce any synchronized subframes");
+    goto cleanup_sync;
+  }
+  if (!mib_found) {
+    ERROR("Raw input staging did not find a valid MIB");
+    goto cleanup_mib;
+  }
+
+  fflush(output);
+  staged_path = temp_path;
+  success     = true;
+  cout << "Using staged synchronized raw input file " << staged_path
+       << " (" << written_subframes << " subframes)" << endl;
+
+cleanup_mib:
+  if (stage_mib_init) {
+    srsran_ue_mib_free(&stage_mib);
+  }
+cleanup_sync:
+  srsran_ue_sync_free(&stage_sync);
+cleanup:
+  if (output != nullptr) {
+    fclose(output);
+    output = nullptr;
+  }
+  if (source.file != nullptr) {
+    fclose(source.file);
+    source.file = nullptr;
+  }
+  if (stage_buffer0 != nullptr) {
+    free(stage_buffer0);
+  }
+  if (!success) {
+    staged_path.clear();
+    if (temp_path[0] != '\0') {
+      unlink(temp_path);
+    }
+  }
+  return success;
+}
+
 LTESniffer_Core::LTESniffer_Core(const Args& args):
   go_exit(false),
   args(args),
@@ -83,7 +362,8 @@ LTESniffer_Core::LTESniffer_Core(const Args& args):
                 &harq,
                 args.mcs_tracking_mode,
                 args.harq_mode,
-                &ulsche);
+                &ulsche,
+                args.dl_dci_min_snr_db);
   phy->getCommon().setShortcutDiscovery(args.enable_shortcut_discovery);
   std::shared_ptr<DCIConsumerList> cons(new DCIConsumerList());
   if(args.dci_file_name != "") {
@@ -110,6 +390,11 @@ bool LTESniffer_Core::run(){
                                         .nof_valid_pss_frames = SRSRAN_DEFAULT_NOF_VALID_PSS_FRAMES,
                                         .init_agc             = 0,
                                         .force_tdd            = false};
+  raw_iq_file_source_t raw_input_file = {};
+  srsran_filesink_t    raw_iq_sink    = {};
+  rf_live_source_t     rf_live_source = {};
+  bool                 use_raw_sync_mode = args.input_file_raw_sync;
+  std::string          file_input_name   = args.input_file_name;
   srsran_cell_t      cell;
   falcon_ue_dl_t     falcon_ue_dl;
   srsran_dl_sf_cfg_t dl_sf;
@@ -227,39 +512,151 @@ bool LTESniffer_Core::run(){
         ERROR("Could not set sampling rate");
         exit(-1);
       }
+      rf_live_source.rx_srate = srate_rf;
     } else {
       ERROR("Invalid number of PRB %d", cell.nof_prb);
       exit(-1);
     }
 
     INFO("Stopping RF and flushing buffer...\r");
+
+    if (!args.raw_iq_output_file.empty()) {
+      if (srsran_filesink_init(&raw_iq_sink, args.raw_iq_output_file.c_str(), SRSRAN_COMPLEX_FLOAT_BIN)) {
+        ERROR("Could not open raw IQ output file %s", args.raw_iq_output_file.c_str());
+        exit(-1);
+      }
+      setvbuf(raw_iq_sink.f, nullptr, _IOFBF, 8 * 1024 * 1024);
+      rf_live_source.rf           = &rf;
+      rf_live_source.raw_sink     = &raw_iq_sink;
+      rf_live_source.nof_channels = args.rf_nof_rx_ant;
+      rf_live_source.write_failed = false;
+      rf_live_source.have_last_rx_ts = false;
+      rf_live_source.last_rx_ts_samples = 0;
+      rf_live_source.last_rx_nsamples = 0;
+      rf_live_source.overflow_count = 0;
+      rf_live_source.late_rx_count = 0;
+      rf_live_source.rx_error_count = 0;
+      rf_live_source.other_error_count = 0;
+      rf_live_source.timestamp_gap_events = 0;
+      rf_live_source.timestamp_gap_samples_accum = 0;
+      rf_live_source.timestamp_gap_samples_max_abs = 0;
+      srsran_rf_register_error_handler(&rf, srsran_rf_error_handler_wrapper, &rf_live_source);
+      printf("Writing live raw IQ capture to %s\n", args.raw_iq_output_file.c_str());
+    } else {
+      rf_live_source.rf           = &rf;
+      rf_live_source.raw_sink     = nullptr;
+      rf_live_source.nof_channels = args.rf_nof_rx_ant;
+      rf_live_source.write_failed = false;
+      rf_live_source.rx_srate = 0.0;
+      rf_live_source.have_last_rx_ts = false;
+      rf_live_source.last_rx_ts_samples = 0;
+      rf_live_source.last_rx_nsamples = 0;
+      rf_live_source.overflow_count = 0;
+      rf_live_source.late_rx_count = 0;
+      rf_live_source.rx_error_count = 0;
+      rf_live_source.other_error_count = 0;
+      rf_live_source.timestamp_gap_events = 0;
+      rf_live_source.timestamp_gap_samples_accum = 0;
+      rf_live_source.timestamp_gap_samples_max_abs = 0;
+    }
   }
 #endif
 
   /* If reading from file, go straight to PDSCH decoding. Otherwise, decode MIB first */
-  if (args.input_file_name != "") {
+  if (file_input_name != "") {
     /* preset cell configuration */
     cell.id              = args.file_cell_id;
     cell.cp              = SRSRAN_CP_NORM;
     cell.phich_length    = SRSRAN_PHICH_NORM;
-    cell.phich_resources = SRSRAN_PHICH_R_1_6;
+    cell.phich_resources = SRSRAN_PHICH_R_1;
     cell.nof_ports       = args.file_nof_ports;
     cell.nof_prb         = args.nof_prb;
 
-    char* tmp_filename = new char[args.input_file_name.length()+1];
-    strncpy(tmp_filename, args.input_file_name.c_str(), args.input_file_name.length());
-    tmp_filename[args.input_file_name.length()] = 0;
-    if (srsran_ue_sync_init_file_multi(&ue_sync,
-                                       args.nof_prb,
-                                       tmp_filename,
-                                       args.file_offset_time,
-                                       args.file_offset_freq,
-                                       args.rf_nof_rx_ant)) { //args.rf_nof_rx_ant
-      ERROR("Error initiating ue_sync");
-      exit(-1);
+    if (use_raw_sync_mode) {
+      if (args.rf_nof_rx_ant != 1) {
+        ERROR("Raw input file sync mode currently supports exactly one RX antenna");
+        exit(-1);
+      }
+
+      raw_input_file.file = fopen(file_input_name.c_str(), "rb");
+      if (raw_input_file.file == nullptr) {
+        perror(file_input_name.c_str());
+        exit(-1);
+      }
+      raw_input_file.eof                  = false;
+      raw_input_file.wrap                 = args.file_wrap;
+      raw_input_file.samples_read         = 0;
+      raw_input_file.input_is_sc16        = args.input_file_raw_sc16;
+      raw_input_file.sc16_buffer          = nullptr;
+      raw_input_file.sc16_capacity_samples = 0;
+      raw_input_file.apply_cfo            = false;
+      raw_input_file.cfo_freq             = 0.0f;
+
+      if (raw_input_file.input_is_sc16) {
+        cout << "Treating raw input file as interleaved sc16 IQ" << endl;
+      } else {
+        cout << "Treating raw input file as interleaved cf32 IQ" << endl;
+      }
+
+      if (args.file_offset_time != 0) {
+        off_t bytes_per_sample = raw_input_file.input_is_sc16 ? static_cast<off_t>(sizeof(int16_t) * 2)
+                                                              : static_cast<off_t>(sizeof(cf_t));
+        off_t byte_offset = static_cast<off_t>(args.file_offset_time) * bytes_per_sample;
+        if (fseeko(raw_input_file.file, byte_offset, SEEK_SET) != 0) {
+          perror("fseeko");
+          fclose(raw_input_file.file);
+          raw_input_file.file = nullptr;
+          exit(-1);
+        }
+      }
+
+      if (args.file_offset_freq != 0.0) {
+        uint32_t raw_cfo_block_len = 3 * SRSRAN_SF_LEN_PRB(cell.nof_prb);
+        if (srsran_cfo_init(&raw_input_file.cfo_correct, raw_cfo_block_len)) {
+          ERROR("Error initiating raw input CFO corrector");
+          fclose(raw_input_file.file);
+          raw_input_file.file = nullptr;
+          exit(-1);
+        }
+        raw_input_file.apply_cfo = true;
+        raw_input_file.cfo_freq  = static_cast<float>(args.file_offset_freq / 15000.0 / srsran_symbol_sz(cell.nof_prb));
+        cout << "Applying raw input frequency correction of " << args.file_offset_freq << " Hz" << endl;
+      }
+
+      if (srsran_ue_sync_init_multi(&ue_sync,
+                                    cell.nof_prb,
+                                    false,
+                                    raw_iq_file_recv_wrapper,
+                                    1,
+                                    &raw_input_file)) {
+        ERROR("Error initiating ue_sync for raw input file");
+        fclose(raw_input_file.file);
+        raw_input_file.file = nullptr;
+        exit(-1);
+      }
+      if (srsran_ue_sync_set_cell(&ue_sync, cell)) {
+        ERROR("Error setting LTE cell for raw input file");
+        fclose(raw_input_file.file);
+        raw_input_file.file = nullptr;
+        exit(-1);
+      }
+    } else {
+      char* tmp_filename = new char[file_input_name.length()+1];
+      strncpy(tmp_filename, file_input_name.c_str(), file_input_name.length());
+      tmp_filename[file_input_name.length()] = 0;
+      if (srsran_ue_sync_init_file_multi(&ue_sync,
+                                         args.nof_prb,
+                                         tmp_filename,
+                                         args.file_offset_time,
+                                         args.file_offset_freq,
+                                         args.rf_nof_rx_ant)) { //args.rf_nof_rx_ant
+        ERROR("Error initiating ue_sync");
+        exit(-1);
+      }
+      srsran_ue_sync_file_wrap(&ue_sync, args.file_wrap);
+      delete[] tmp_filename;
+      tmp_filename = nullptr;
     }
-    delete[] tmp_filename;
-    tmp_filename = nullptr;
 
   } else {
 #ifndef DISABLE_RF
@@ -276,7 +673,7 @@ bool LTESniffer_Core::run(){
                                         cell.id == 1000,
                                         srsran_rf_recv_wrapper,
                                         args.rf_nof_rx_ant,
-                                        (void*)&rf,
+                                        (void*)&rf_live_source,
                                         decimate)) {
       ERROR("Error initiating ue_sync");
       exit(-1);
@@ -300,20 +697,26 @@ bool LTESniffer_Core::run(){
 
   /* Config mib */
   srsran_ue_mib_t ue_mib;
+  srsran_cell_t   mib_cell = cell;
+  if (use_raw_sync_mode) {
+    mib_cell.nof_ports = 0;
+  }
   if (srsran_ue_mib_init(&ue_mib, cur_buffer[0], cell.nof_prb)) {
     ERROR("Error initaiting UE MIB decoder");
     exit(-1);
   }
-  if (srsran_ue_mib_set_cell(&ue_mib, cell)) {
+  if (srsran_ue_mib_set_cell(&ue_mib, mib_cell)) {
     ERROR("Error initaiting UE MIB decoder");
     exit(-1);
   }
-
   // Disable CP based CFO estimation during find
   ue_sync.cfo_current_value       = search_cell_cfo / 15000;
   ue_sync.cfo_is_copied           = true;
   ue_sync.cfo_correct_enable_find = true;
   srsran_sync_set_cfo_cp_enable(&ue_sync.sfind, false, 0);
+  if (use_raw_sync_mode) {
+    srsran_sync_set_threshold(&ue_sync.sfind, 1.5f);
+  }
   
   ZERO_OBJECT(dl_sf);
   ZERO_OBJECT(pdsch_cfg);
@@ -353,6 +756,11 @@ bool LTESniffer_Core::run(){
   uint64_t sf_cnt          = 0;
   //uint32_t sfn             = 0;
   uint32_t last_decoded_tm = 0;
+  bool     raw_stream_started          = false;
+  uint32_t raw_expected_sf_idx         = 0;
+  uint64_t raw_search_subframes        = 0;
+  uint64_t raw_lock_subframes          = 0;
+  uint32_t raw_lock_sf0_attempts       = 0;
 
   /* Length in complex samples */
   uint32_t max_num_samples = 3 * SRSRAN_SF_LEN_PRB(cell.nof_prb); 
@@ -365,9 +773,15 @@ bool LTESniffer_Core::run(){
     ret = srsran_ue_sync_zerocopy(&ue_sync, cur_worker->getBuffers(), max_num_samples);
     if (ret < 0) {
       if (args.input_file_name != ""){
+        if (use_raw_sync_mode && raw_input_file.eof) {
+          std::cout << "Finish reading raw input file" << std::endl;
+          break;
+        }
         std::cout << "Finish reading from file" << std::endl;
+        break;
       }
       ERROR("Error calling srsran_ue_sync_work()");
+      break;
     }
     // std:: cout << "CFO = " << srsran_ue_sync_get_cfo(&ue_sync) << std::endl;
 #ifdef CORRECT_SAMPLE_OFFSET
@@ -378,20 +792,84 @@ bool LTESniffer_Core::run(){
 
     if (ret == 1){
       uint32_t sf_idx = srsran_ue_sync_get_sfidx(&ue_sync);
+      uint32_t logical_sf_idx = sf_idx;
+      if (use_raw_sync_mode && state == DECODE_MIB) {
+        if (!raw_stream_started) {
+          raw_search_subframes++;
+          if (raw_search_subframes > 4000) {
+            ERROR("Failed to lock to a stable subframe-0 boundary while streaming raw input file");
+            break;
+          }
+          if (sf_idx != 0) {
+            continue;
+          }
+          raw_stream_started  = true;
+          raw_expected_sf_idx = 0;
+          raw_lock_subframes  = 0;
+          raw_lock_sf0_attempts = 0;
+          srsran_ue_mib_reset(&ue_mib);
+          cout << "Raw input stream locked at raw_samples=" << raw_input_file.samples_read << endl;
+        }
+        if (sf_idx != raw_expected_sf_idx) {
+          cout << "Raw input stream discarded short lock after sf_idx jump from "
+               << raw_expected_sf_idx << " to " << sf_idx << endl;
+          raw_stream_started  = false;
+          raw_expected_sf_idx = 0;
+          raw_lock_subframes  = 0;
+          raw_lock_sf0_attempts = 0;
+          srsran_ue_mib_reset(&ue_mib);
+          continue;
+        }
+        raw_lock_subframes++;
+        raw_expected_sf_idx = (raw_expected_sf_idx + 1) % 10;
+      }
       switch (state) {
         case DECODE_MIB:
           if (sf_idx == 0) {
             uint8_t bch_payload[SRSRAN_BCH_PAYLOAD_LEN];
             int     sfn_offset;
+            if (use_raw_sync_mode) {
+              raw_lock_sf0_attempts++;
+            }
             n = srsran_ue_mib_decode(&ue_mib, bch_payload, NULL, &sfn_offset);
             if (n < 0) {
               ERROR("Error decoding UE MIB");
               exit(-1);
             } else if (n == SRSRAN_UE_MIB_FOUND) {
-              srsran_pbch_mib_unpack(bch_payload, &cell, &sfn);
-              srsran_cell_fprint(stdout, &cell, sfn);
-              printf("Decoded MIB. SFN: %d, offset: %d\n", sfn, sfn_offset);
-              sfn   = (sfn + sfn_offset) % 1024;
+              srsran_cell_t decoded_mib_cell = cell;
+              uint32_t      decoded_sfn      = 0;
+              srsran_pbch_mib_unpack(bch_payload, &decoded_mib_cell, &decoded_sfn);
+
+              if (args.input_file_name != "") {
+                if (!srsran_cell_isvalid(&decoded_mib_cell) || decoded_mib_cell.nof_prb != cell.nof_prb) {
+                  cout << "Rejected file-input MIB candidate at sf_idx=" << sf_idx
+                       << ": decoded PRB=" << decoded_mib_cell.nof_prb
+                       << ", expected PRB=" << cell.nof_prb << endl;
+                  srsran_ue_mib_reset(&ue_mib);
+                  break;
+                }
+              }
+
+              if (use_raw_sync_mode) {
+                cell.nof_ports       = decoded_mib_cell.nof_ports;
+                cell.cp              = decoded_mib_cell.cp;
+                cell.phich_length    = decoded_mib_cell.phich_length;
+                cell.phich_resources = decoded_mib_cell.phich_resources;
+                cell.nof_prb         = decoded_mib_cell.nof_prb;
+                raw_search_subframes = 0;
+                raw_lock_subframes   = 0;
+                raw_lock_sf0_attempts = 0;
+              } else if (args.input_file_name == "") {
+                cell = decoded_mib_cell;
+              }
+
+              srsran_cell_fprint(stdout, &decoded_mib_cell, decoded_sfn);
+              printf("Decoded MIB. SFN: %d, offset: %d\n", decoded_sfn, sfn_offset);
+              sfn = (decoded_sfn + sfn_offset) % 1024;
+              if (!phy->setCell(cell)) {
+                cout << "Error updating UE downlink processing module after MIB decode" << endl;
+                exit(-1);
+              }
               state = DECODE_PDSCH;
 
               //config RNTI Manager from Falcon Lib
@@ -411,13 +889,23 @@ bool LTESniffer_Core::run(){
                 rntiManager.addEvergreen(SRSRAN_PRNTI, SRSRAN_SIRNTI, static_cast<uint32_t>(idx));
               }
               // add forbidden rnti values to rnti manager
-              for(uint32_t f=0; f<nof_falcon_ue_all_formats; f++) {
-                  //disallow RNTI=0 for all formats
-                rntiManager.addForbidden(0x0, 0x0, f);
-              }
-            }
-          }
-          break;
+	              for(uint32_t f=0; f<nof_falcon_ue_all_formats; f++) {
+	                  //disallow RNTI=0 for all formats
+	                rntiManager.addForbidden(0x0, 0x0, f);
+	              }
+	            } else if (use_raw_sync_mode && raw_lock_sf0_attempts >= 12) {
+	              cout << "Raw input stream discarded lock without a valid MIB after "
+	                   << raw_lock_subframes << " synchronized subframes and "
+	                   << raw_lock_sf0_attempts << " sf0 attempts" << endl;
+	              raw_stream_started   = false;
+	              raw_expected_sf_idx  = 0;
+	              raw_search_subframes = 0;
+	              raw_lock_subframes   = 0;
+	              raw_lock_sf0_attempts = 0;
+	              srsran_ue_mib_reset(&ue_mib);
+	            }
+	          }
+	          break;
         case DECODE_PDSCH:
           if ((mcs_tracking.get_nof_api_msg()%30) == 0 && api_mode > -1){
             print_api_header();
@@ -426,12 +914,12 @@ bool LTESniffer_Core::run(){
               mcs_tracking.reset_nof_api_msg();
             }
           }
-          uint32_t tti = sfn * 10 + sf_idx;
+          uint32_t tti = sfn * 10 + logical_sf_idx;
 
           /* Prepare sf_idx and sfn for worker , SF_NRM only*/
           dl_sf.tti = tti;
           dl_sf.sf_type = SRSRAN_SF_NORM;
-          cur_worker->prepare(sf_idx, sfn, sf_cnt % (args.dci_format_split_update_interval_ms) == 0, dl_sf);
+          cur_worker->prepare(logical_sf_idx, sfn, sf_cnt % (args.dci_format_split_update_interval_ms) == 0, dl_sf);
 
           /*Get next worker from avail list*/
           std:shared_ptr<SubframeWorker> next_worker;
@@ -453,7 +941,7 @@ bool LTESniffer_Core::run(){
       }
 
       /*increase system frame number*/
-      if (sf_idx == 9) {
+      if (logical_sf_idx == 9) {
         sfn++;
       }
       if (sfn == 1024){
@@ -503,15 +991,25 @@ bool LTESniffer_Core::run(){
           break;
         }
       }
+      sf_cnt++;
     } else if(ret == 0){ //get buffer wrong or out of sync
       /*Change state to Decode MIB to find system frame number again*/
       if (state == DECODE_PDSCH && nof_lost_sync > 5){
         state = DECODE_MIB;
+        raw_stream_started          = false;
+        raw_expected_sf_idx         = 0;
+        raw_search_subframes        = 0;
+        raw_lock_subframes          = 0;
+        raw_lock_sf0_attempts       = 0;
+        srsran_cell_t mib_reset_cell = cell;
+        if (use_raw_sync_mode) {
+          mib_reset_cell.nof_ports = 0;
+        }
         if (srsran_ue_mib_init(&ue_mib, cur_worker->getBuffers()[0], cell.nof_prb)) {
           ERROR("Error initaiting UE MIB decoder");
           exit(-1);
         }
-        if (srsran_ue_mib_set_cell(&ue_mib, cell)) {
+        if (srsran_ue_mib_set_cell(&ue_mib, mib_reset_cell)) {
           ERROR("Error initaiting UE MIB decoder");
           exit(-1);
         }
@@ -523,7 +1021,6 @@ bool LTESniffer_Core::run(){
               ", FrameCnt: " << ue_sync.frame_total_cnt <<
               " State: " << ue_sync.state << endl;
     }
-    sf_cnt++;
 
   } // main loop
 
@@ -548,11 +1045,33 @@ bool LTESniffer_Core::run(){
 
   std::cout << "Destroyed Phy" << std::endl;
   if (args.input_file_name == ""){
+    if (!args.raw_iq_output_file.empty()) {
+      cout << "Live raw IQ capture summary: overflows=" << rf_live_source.overflow_count.load()
+           << ", late_rx=" << rf_live_source.late_rx_count.load()
+           << ", rx_errors=" << rf_live_source.rx_error_count.load()
+           << ", other_errors=" << rf_live_source.other_error_count.load()
+           << ", timestamp_gap_events=" << rf_live_source.timestamp_gap_events
+           << ", timestamp_gap_samples_accum=" << rf_live_source.timestamp_gap_samples_accum
+           << ", timestamp_gap_samples_max_abs=" << rf_live_source.timestamp_gap_samples_max_abs
+           << (rf_live_source.write_failed ? ", file_write_failed=1" : ", file_write_failed=0")
+           << endl;
+    }
     srsran_rf_close(&rf);
-    //srsran_ue_dl_free(falcon_ue_dl.q);
-    srsran_ue_sync_free(&ue_sync);
-    srsran_ue_mib_free(&ue_mib);
+    if (raw_iq_sink.f != nullptr) {
+      srsran_filesink_free(&raw_iq_sink);
+    }
+  } else if (use_raw_sync_mode && raw_input_file.file != nullptr) {
+    fclose(raw_input_file.file);
+    if (raw_input_file.sc16_buffer != nullptr) {
+      free(raw_input_file.sc16_buffer);
+    }
+    if (raw_input_file.apply_cfo) {
+      srsran_cfo_free(&raw_input_file.cfo_correct);
+    }
   }
+  //srsran_ue_dl_free(falcon_ue_dl.q);
+  srsran_ue_sync_free(&ue_sync);
+  srsran_ue_mib_free(&ue_mib);
   //common->getRNTIManager().printActiveSet();
   cout << "Skipped subframe: " << skip_cnt << " / " << sf_cnt << endl;
   //phy->getCommon().getRNTIManager().printActiveSet();
@@ -593,11 +1112,129 @@ int srsran_rf_recv_wrapper( void* h,
                             uint32_t nsamples, 
                             srsran_timestamp_t* t){
   DEBUG(" ----  Receive %d samples  ----", nsamples);
+  rf_live_source_t* source = static_cast<rf_live_source_t*>(h);
+  if (source == nullptr || source->rf == nullptr) {
+    return SRSRAN_ERROR_INVALID_INPUTS;
+  }
   void* ptr[SRSRAN_MAX_PORTS];
   for (int i = 0; i < SRSRAN_MAX_PORTS; i++) {
     ptr[i] = data_[i];
   }
-  return srsran_rf_recv_with_time_multi((srsran_rf_t*)h, ptr, nsamples, true, NULL, NULL);
+  time_t secs = 0;
+  double frac_secs = 0.0;
+  int ret = srsran_rf_recv_with_time_multi(source->rf, ptr, nsamples, true, &secs, &frac_secs);
+  if (ret > 0 && source->raw_sink != nullptr && !source->write_failed) {
+    int written = srsran_filesink_write_multi(source->raw_sink, ptr, ret, source->nof_channels);
+    if (written != ret * static_cast<int>(source->nof_channels)) {
+      source->write_failed = true;
+      ERROR("Failed writing live raw IQ capture file, disabling recorder");
+    }
+  }
+  if (ret > 0 && source->rx_srate > 0.0) {
+    srsran_timestamp_t rx_ts = {};
+    srsran_timestamp_init(&rx_ts, secs, frac_secs);
+    uint64_t current_ts_samples = srsran_timestamp_uint64(&rx_ts, source->rx_srate);
+    if (source->have_last_rx_ts) {
+      uint64_t expected_ts_samples = source->last_rx_ts_samples + source->last_rx_nsamples;
+      int64_t delta = static_cast<int64_t>(current_ts_samples) - static_cast<int64_t>(expected_ts_samples);
+      if (delta != 0) {
+        source->timestamp_gap_events++;
+        source->timestamp_gap_samples_accum += delta;
+        int64_t abs_delta = llabs(delta);
+        if (abs_delta > source->timestamp_gap_samples_max_abs) {
+          source->timestamp_gap_samples_max_abs = abs_delta;
+        }
+      }
+    }
+    source->have_last_rx_ts = true;
+    source->last_rx_ts_samples = current_ts_samples;
+    source->last_rx_nsamples = static_cast<uint32_t>(ret);
+  }
+  if (t != nullptr && ret > 0) {
+    srsran_timestamp_init(t, secs, frac_secs);
+  }
+  return ret;
+}
+
+void srsran_rf_error_handler_wrapper(void* arg, srsran_rf_error_t error)
+{
+  rf_live_source_t* source = static_cast<rf_live_source_t*>(arg);
+  if (source == nullptr) {
+    return;
+  }
+
+  switch (error.type) {
+    case srsran_rf_error_t::SRSRAN_RF_ERROR_OVERFLOW:
+      source->overflow_count++;
+      break;
+    case srsran_rf_error_t::SRSRAN_RF_ERROR_LATE:
+      if (error.opt == 1) {
+        source->late_rx_count++;
+      } else {
+        source->other_error_count++;
+      }
+      break;
+    case srsran_rf_error_t::SRSRAN_RF_ERROR_RX:
+      source->rx_error_count++;
+      break;
+    default:
+      source->other_error_count++;
+      break;
+  }
+}
+
+int raw_iq_file_recv_wrapper(void* h, cf_t* data_[SRSRAN_MAX_PORTS], uint32_t nsamples, srsran_timestamp_t* t)
+{
+  raw_iq_file_source_t* source = static_cast<raw_iq_file_source_t*>(h);
+  (void)t;
+
+  if (source == nullptr || source->file == nullptr || data_[0] == nullptr) {
+    return SRSRAN_ERROR_INVALID_INPUTS;
+  }
+
+  uint32_t total_read = 0;
+  while (total_read < nsamples) {
+    size_t nread = 0;
+    if (source->input_is_sc16) {
+      if (source->sc16_capacity_samples < nsamples) {
+        int16_t* resized = static_cast<int16_t*>(realloc(source->sc16_buffer, sizeof(int16_t) * 2 * nsamples));
+        if (resized == nullptr) {
+          return SRSRAN_ERROR;
+        }
+        source->sc16_buffer = resized;
+        source->sc16_capacity_samples = nsamples;
+      }
+
+      nread = fread(source->sc16_buffer, sizeof(int16_t) * 2, nsamples - total_read, source->file);
+      for (size_t i = 0; i < nread; ++i) {
+        cf_t sample = 0.0f;
+        __real__ sample = static_cast<float>(source->sc16_buffer[2 * i]) / 32768.0f;
+        __imag__ sample = static_cast<float>(source->sc16_buffer[2 * i + 1]) / 32768.0f;
+        data_[0][total_read + i] = sample;
+      }
+    } else {
+      nread = fread(&data_[0][total_read], sizeof(cf_t), nsamples - total_read, source->file);
+    }
+    source->samples_read += nread;
+    total_read += static_cast<uint32_t>(nread);
+
+    if (total_read == nsamples) {
+      if (source->apply_cfo) {
+        srsran_cfo_correct(&source->cfo_correct, data_[0], data_[0], source->cfo_freq);
+      }
+      return static_cast<int>(total_read);
+    }
+
+    if (!source->wrap || !feof(source->file)) {
+      source->eof = true;
+      return SRSRAN_ERROR;
+    }
+
+    clearerr(source->file);
+    rewind(source->file);
+  }
+
+  return static_cast<int>(total_read);
 }
 
 void LTESniffer_Core::setDCIConsumer(std::shared_ptr<SubframeInfoConsumer> consumer) {
